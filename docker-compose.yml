@@ -1,0 +1,37 @@
+version: '3.8'
+
+services:
+  # Similarity Search & Inference Service
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: apsse-engine
+    ports:
+      - "8000:8000"
+    environment:
+      - DEFAULT_MODEL=vit
+      - CLUSTER_NODE_ID=node-worker-01
+      - PORT=8000
+    volumes:
+      - ./backend/static:/app/backend/static
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/stats"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Web Dashboard (Optional standalone container when running multi-tier)
+  frontend:
+    image: node:20-alpine
+    container_name: apsse-ui
+    working_dir: /app
+    volumes:
+      - ./frontend:/app
+    ports:
+      - "3000:3000"
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
+    depends_on:
+      - backend
+    restart: unless-stopped
