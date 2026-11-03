@@ -1,6 +1,22 @@
 version: '3.8'
 
 services:
+  # Standalone Vector Database (Qdrant)
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: apsse-qdrant
+    ports:
+      - "6333:6333" # REST & Web UI
+      - "6334:6334" # gRPC
+    volumes:
+      - ./qdrant_storage:/qdrant/storage
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
   # Similarity Search & Inference Service
   backend:
     build:
@@ -13,8 +29,14 @@ services:
       - DEFAULT_MODEL=vit
       - CLUSTER_NODE_ID=node-worker-01
       - PORT=8000
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
     volumes:
       - ./backend/static:/app/backend/static
+      - ./backend/qdrant_storage:/app/backend/qdrant_storage
+      - ./dataset/extracted:/app/dataset/extracted
+    depends_on:
+      - qdrant
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/api/stats"]
@@ -22,7 +44,7 @@ services:
       timeout: 10s
       retries: 3
 
-  # Web Dashboard (Optional standalone container when running multi-tier)
+  # Web Dashboard
   frontend:
     image: node:20-alpine
     container_name: apsse-ui

@@ -283,3 +283,19 @@ def init_database():
 
 # Run initialization on import
 init_database()
+
+
+import json
+DATASET_JSON = Path(__file__).resolve().parent / "dataset_cases.json"
+
+def get_combined_catalog():
+    """Returns combined catalog of industrial base cases and ingested concrete crack cases."""
+    cases = list(CASES_METADATA)
+    if DATASET_JSON.exists():
+        try:
+            with open(DATASET_JSON, "r", encoding="utf-8") as f:
+                extra_cases = json.load(f)
+                cases.extend(extra_cases)
+        except Exception:
+            pass
+    return cases

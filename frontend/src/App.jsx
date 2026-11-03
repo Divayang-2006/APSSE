@@ -553,10 +553,10 @@ export default function App() {
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
                   <div>
                     <h2 style={{ fontSize: 16, fontWeight: 700, color: '#f8fafc' }}>
-                      Top-{topK} Similar Damage Cases Retrieved
+                      Similar Cases
                     </h2>
                     <p style={{ fontSize: 12, color: '#94a3b8' }}>
-                      Ranked descending by Cosine Similarity Metric: Similarity(u, v) = u • v
+                      Output should show image with score of similarity
                     </p>
                   </div>
                 </div>
