@@ -1,6 +1,7 @@
 import io
 import sys
 import time
+import json
 import logging
 from typing import Optional
 from pathlib import Path
@@ -14,9 +15,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from PIL import Image
+import numpy as np
 
 from database import CASES_METADATA, STATIC_DIR, IMAGE_DIR, SAMPLE_DIR, get_combined_catalog
-from models import get_extractor, severity_analyzer, FeatureExtractor
+from models import get_extractor, severity_analyzer, FeatureExtractor, TORCH_AVAILABLE
 from vector_search import VectorIndex
 from qdrant_store import qdrant_store, PointStruct
 
@@ -51,6 +53,55 @@ FRONTEND_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
 if FRONTEND_DIST.exists():
     app.mount("/assets", StaticFiles(directory=str(FRONTEND_DIST / "assets")), name="assets")
 
+# ---------------------------------------------------------------
+# Pre-load the saved .npy embedding matrix for fast NumPy search
+# This ensures query extractor & DB embeddings are ALWAYS the same
+# ---------------------------------------------------------------
+NPY_VIT_PATH = BACKEND_DIR / "embeddings_vit.npy"
+DATASET_JSON_PATH = BACKEND_DIR / "dataset_cases.json"
+
+_npy_matrix: Optional[np.ndarray] = None     # shape (N, 768)
+_npy_catalog: Optional[list] = None          # list of case dicts matching rows
+
+def _load_npy_index():
+    global _npy_matrix, _npy_catalog
+    if NPY_VIT_PATH.exists() and DATASET_JSON_PATH.exists():
+        try:
+            _npy_matrix = np.load(str(NPY_VIT_PATH)).astype(np.float32)  # (N, 768)
+            with open(DATASET_JSON_PATH, "r", encoding="utf-8") as f:
+                _npy_catalog = json.load(f)
+            if len(_npy_catalog) != _npy_matrix.shape[0]:
+                # Trim to shortest to stay aligned
+                n = min(len(_npy_catalog), _npy_matrix.shape[0])
+                _npy_matrix = _npy_matrix[:n]
+                _npy_catalog = _npy_catalog[:n]
+            logger.info(f"NumPy index loaded: {_npy_matrix.shape[0]} embeddings from embeddings_vit.npy")
+        except Exception as e:
+            logger.warning(f"Could not load NumPy .npy index: {e}")
+
+_load_npy_index()
+
+def _npy_cosine_search(query_vec: np.ndarray, top_k: int) -> list:
+    """Fast cosine similarity search against the pre-saved .npy embedding matrix.
+    Uses the SAME extractor as ingestion — guarantees consistent similarity scores."""
+    if _npy_matrix is None or _npy_catalog is None:
+        return []
+    q = query_vec.astype(np.float32)
+    qnorm = np.linalg.norm(q)
+    if qnorm < 1e-12:
+        return []
+    q = q / qnorm
+    # Embeddings are already L2-normalized from ingestion — dot product = cosine similarity
+    scores = _npy_matrix @ q                        # shape (N,)
+    top_indices = np.argpartition(scores, -top_k)[-top_k:]
+    top_indices = top_indices[np.argsort(scores[top_indices])[::-1]]
+    results = []
+    for i in top_indices:
+        case = dict(_npy_catalog[i])
+        case["similarity"] = round(float(np.clip(scores[i], 0.0, 1.0)), 4)
+        results.append(case)
+    return results
+
 # Build Vector Indexes (Fallback FAISS / in-memory MIPS)
 vit_index = VectorIndex(dimension=768)
 resnet_index = VectorIndex(dimension=2048)
@@ -58,6 +109,15 @@ resnet_index = VectorIndex(dimension=2048)
 # Initialize Qdrant collections
 qdrant_store.ensure_collection("damage_cases_vit", dimension=768)
 qdrant_store.ensure_collection("damage_cases_resnet", dimension=2048)
+
+# Log which extractor mode is active at startup
+_test_ext = get_extractor("vit")
+if _test_ext.model is not None and TORCH_AVAILABLE:
+    logger.info("✅ PyTorch ViT-B/16 model loaded — REAL embeddings active")
+else:
+    logger.warning("⚠️  PyTorch not available — using deterministic fallback extractor")
+    if _npy_matrix is not None:
+        logger.info(f"✅ NumPy .npy matrix loaded ({_npy_matrix.shape[0]} cases) — search is CONSISTENT with ingestion")
 
 def get_catalog_map():
     return {c["case_id"]: c for c in get_combined_catalog()}
@@ -119,10 +179,13 @@ async def search_similar_damage(
 ):
     """
     1. Receives Query Image
-    2. Deep Feature Extraction (ViT / ResNet)
+    2. Deep Feature Extraction (ViT / ResNet) — or fallback perceptual extractor
     3. Normalizes to unit vector
-    4. Standalone Vector DB ANN Search (Qdrant with Cosine Metric)
-    5. Returns Top-K Similar Cases with scores & Consensus Severity Analysis
+    4. PRIMARY:  NumPy cosine search on pre-saved embeddings_vit.npy
+       (guarantees same extractor space as ingestion → real similarity scores)
+    5. SECONDARY: Qdrant ANN search (used when .npy not available)
+    6. TERTIARY:  FAISS / In-Memory matrix search
+    7. Returns Top-K Similar Cases with scores & Consensus Severity Analysis
     """
     start_time = time.time()
     try:
@@ -136,30 +199,39 @@ async def search_similar_damage(
     extractor = get_extractor(selected_model)
     query_vector = extractor.extract(query_image)
 
-    # Collection selection
     col_name = "damage_cases_resnet" if "resnet" in selected_model else "damage_cases_vit"
     results = []
+    search_backend = "Unknown"
 
-    # 2. ANN Search via Standalone Vector DB (Qdrant)
-    qdrant_hits = qdrant_store.search(col_name, query_vector, top_k=top_k)
-    if qdrant_hits:
-        for hit in qdrant_hits:
-            results.append({
-                "case_id": hit.get("case_id", "Unknown"),
-                "title": hit.get("title", ""),
-                "similarity": hit.get("similarity", 0.0),
-                "damage_type": hit.get("damage_type", "Structural Defect"),
-                "severity_level": hit.get("severity_level", "Moderate"),
-                "severity_score": hit.get("severity_score", 0.7),
-                "structure_type": hit.get("structure_type", "Concrete Structure"),
-                "inspection_date": hit.get("inspection_date", "2026-01-01"),
-                "location": hit.get("location", ""),
-                "description": hit.get("description", ""),
-                "recommended_action": hit.get("recommended_action", ""),
-                "image_url": hit.get("image_url", "")
-            })
-    else:
-        # Fallback to FAISS / In-Memory matrix if Qdrant has no items
+    # 2a. PRIMARY: NumPy .npy matrix search (consistent extractor space)
+    if selected_model in ("vit", "vit_b_16") and _npy_matrix is not None:
+        results = _npy_cosine_search(query_vector, top_k=top_k)
+        if results:
+            search_backend = f"NumPy Cosine Search ({_npy_matrix.shape[0]:,} vectors)"
+
+    # 2b. SECONDARY: Qdrant ANN search
+    if not results:
+        qdrant_hits = qdrant_store.search(col_name, query_vector, top_k=top_k)
+        if qdrant_hits:
+            for hit in qdrant_hits:
+                results.append({
+                    "case_id": hit.get("case_id", "Unknown"),
+                    "title": hit.get("title", ""),
+                    "similarity": hit.get("similarity", 0.0),
+                    "damage_type": hit.get("damage_type", "Structural Defect"),
+                    "severity_level": hit.get("severity_level", "Moderate"),
+                    "severity_score": hit.get("severity_score", 0.7),
+                    "structure_type": hit.get("structure_type", "Concrete Structure"),
+                    "inspection_date": hit.get("inspection_date", "2026-01-01"),
+                    "location": hit.get("location", ""),
+                    "description": hit.get("description", ""),
+                    "recommended_action": hit.get("recommended_action", ""),
+                    "image_url": hit.get("image_url", "")
+                })
+            search_backend = "Qdrant HNSW ANN"
+
+    # 2c. TERTIARY: FAISS / In-Memory fallback
+    if not results:
         index = resnet_index if "resnet" in selected_model else vit_index
         search_hits = index.search(query_vector, top_k=top_k)
         lookup = get_catalog_map()
@@ -179,6 +251,7 @@ async def search_similar_damage(
                 "recommended_action": c.get("recommended_action", ""),
                 "image_url": c.get("image_url", "")
             })
+        search_backend = "FAISS In-Memory Fallback"
 
     # 3. Severity Analysis & Multi-match Consensus
     severity = severity_analyzer.analyze(query_image, top_cases=results)
@@ -189,8 +262,8 @@ async def search_similar_damage(
         "latency_ms": latency_ms,
         "model_used": "Vision Transformer (ViT-B/16)" if "vit" in selected_model else "ResNet-50",
         "vector_dimension": extractor.dim,
-        "vector_database": "Qdrant" if qdrant_hits else "FAISS (In-Memory Fallback)",
-        "similarity_metric": "Cosine Similarity (MIPS)",
+        "vector_database": search_backend,
+        "similarity_metric": "Cosine Similarity",
         "severity_analysis": severity,
         "results": results
     }

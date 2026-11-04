@@ -50,3 +50,24 @@ dataset/
 qdrant_storage/
 backend/qdrant_storage/
 backend/data/
+
+# Embeddings / models
+*.npy
+*.npz
+*.pt
+*.pth
+*.safetensors
+
+# Local Qdrant storage + ingest logs
+backend/vector_db_data*/
+backend/*_log.txt
+
+# LaTeX build junk
+*.aux
+*.log
+*.out
+*.synctex.gz
+*.fls
+*.fdb_latexmk
+*.bbl
+*.blg

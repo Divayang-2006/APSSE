@@ -14,7 +14,14 @@ try:
 except Exception as e:
     logger.warning(f"qdrant-client not available: {e}")
 
-STORAGE_DIR = Path(__file__).resolve().parent / "vector_db_data"
+_storage_env = os.getenv("QDRANT_STORAGE_DIR", "")
+if _storage_env:
+    STORAGE_DIR = Path(_storage_env)
+else:
+    # Prefer the full 40K indexed DB if it exists, fall back to original
+    _full_db = Path(__file__).resolve().parent / "vector_db_data_full"
+    _orig_db = Path(__file__).resolve().parent / "vector_db_data"
+    STORAGE_DIR = _full_db if _full_db.exists() else _orig_db
 
 class QdrantVectorStore:
     """Standalone Vector Database client using Qdrant (distributed server or embedded storage)."""

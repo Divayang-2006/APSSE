@@ -92,7 +92,7 @@ def generate_case_metadata(img_path: Path, is_positive: bool, case_idx: int) -> 
     }
 
 def run_ingestion(total_samples: int = 1000, batch_size: int = 100, reset: bool = False):
-    """Ingests dataset images into Qdrant and saves metadata catalog."""
+    """Ingests dataset images into Qdrant and saves metadata catalog + embeddings_vit.npy."""
     if not POSITIVE_DIR.exists() or not NEGATIVE_DIR.exists():
         logger.error(f"Dataset folders missing in {DATASET_ROOT}. Ensure extraction completed.")
         return
@@ -121,6 +121,7 @@ def run_ingestion(total_samples: int = 1000, batch_size: int = 100, reset: bool 
     vit_points = []
     resnet_points = []
     catalog = []
+    all_vit_vecs = []  # accumulate for .npy save
 
     for idx, (img_path, is_pos) in enumerate(combined):
         try:
@@ -132,6 +133,7 @@ def run_ingestion(total_samples: int = 1000, batch_size: int = 100, reset: bool 
             case_idx = idx + 1
             metadata = generate_case_metadata(img_path, is_pos, case_idx)
             catalog.append(metadata)
+            all_vit_vecs.append(vit_vec)
 
             vit_points.append(PointStruct(id=case_idx, vector=vit_vec, payload=metadata))
             resnet_points.append(PointStruct(id=case_idx, vector=resnet_vec, payload=metadata))
@@ -139,14 +141,17 @@ def run_ingestion(total_samples: int = 1000, batch_size: int = 100, reset: bool 
             if len(vit_points) >= batch_size:
                 qdrant_store.upsert_batch("damage_cases_vit", vit_points, batch_size=batch_size)
                 qdrant_store.upsert_batch("damage_cases_resnet", resnet_points, batch_size=batch_size)
-                logger.info(f"Upserted {case_idx}/{len(combined)} points into Qdrant...")
+                logger.info(f"[{case_idx}/{len(combined)}] Upserted batch into Qdrant...")
                 vit_points = []
                 resnet_points = []
 
-                # Periodic catalog flush
+                # Periodic catalog + .npy flush every 1000 images
                 if case_idx % 1000 == 0:
                     with open(OUTPUT_JSON, "w", encoding="utf-8") as f:
                         json.dump(catalog, f, indent=2)
+                    npy_path = BACKEND_DIR / "embeddings_vit.npy"
+                    np.save(str(npy_path), np.array(all_vit_vecs, dtype=np.float32))
+                    logger.info(f"[{case_idx}/{len(combined)}] Checkpoint: saved catalog JSON + embeddings_vit.npy")
 
         except Exception as e:
             logger.warning(f"Error processing {img_path}: {e}")
@@ -160,14 +165,27 @@ def run_ingestion(total_samples: int = 1000, batch_size: int = 100, reset: bool 
     with open(OUTPUT_JSON, "w", encoding="utf-8") as f:
         json.dump(catalog, f, indent=2)
 
+    # Save final embeddings matrix
+    npy_path = BACKEND_DIR / "embeddings_vit.npy"
+    np.save(str(npy_path), np.array(all_vit_vecs, dtype=np.float32))
+
     logger.info(f"Ingestion Finished! Total cases indexed in Qdrant: {len(catalog)}")
     logger.info(f"Saved catalog to {OUTPUT_JSON}")
+    logger.info(f"Saved embeddings matrix to {npy_path}  shape={np.array(all_vit_vecs).shape}")
     logger.info(f"Qdrant collection 'damage_cases_vit' count: {qdrant_store.count('damage_cases_vit')}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Ingest Concrete Crack Dataset into Qdrant Vector DB")
     parser.add_argument("--samples", type=int, default=1000, help="Number of images to ingest (0 for all 40,000, default: 1000)")
     parser.add_argument("--batch-size", type=int, default=100, help="Batch size for upserting into Qdrant")
+    parser.add_argument("--storage-dir", type=str, default="", help="Override Qdrant embedded storage directory path")
     args = parser.parse_args()
+
+    # Override storage path if specified (avoids lock conflicts with existing DB)
+    if args.storage_dir:
+        import qdrant_store as _qs_module
+        from pathlib import Path as _Path
+        _qs_module.STORAGE_DIR = _Path(args.storage_dir)
+        _qs_module.qdrant_store = _qs_module.QdrantVectorStore()
 
     run_ingestion(total_samples=args.samples, batch_size=args.batch_size)

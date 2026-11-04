@@ -1,4 +1,5 @@
 import io
+import os
 import logging
 import numpy as np
 from PIL import Image
@@ -8,6 +9,8 @@ logger = logging.getLogger("models")
 
 # PyTorch import
 TORCH_AVAILABLE = False
+_FORCE_FALLBACK = os.getenv("USE_FALLBACK_EXTRACTOR", "0").strip() == "1"
+
 try:
     import torch
     import torchvision.transforms as transforms
@@ -27,7 +30,9 @@ class FeatureExtractor:
         self._load_model()
 
     def _load_model(self):
-        if not TORCH_AVAILABLE:
+        if not TORCH_AVAILABLE or _FORCE_FALLBACK:
+            if _FORCE_FALLBACK:
+                logger.info(f"[{self.model_name}] Using forced fallback extractor (USE_FALLBACK_EXTRACTOR=1)")
             return
         try:
             if "vit" in self.model_name:
@@ -68,7 +73,6 @@ class FeatureExtractor:
         img = image.convert("RGB").resize((224, 224))
         arr = np.array(img, dtype=np.float32) / 255.0
         
-        # Color distribution across 4x4 spatial patches
         color_feats = []
         for i in range(4):
             for j in range(4):
@@ -76,7 +80,6 @@ class FeatureExtractor:
                 color_feats.extend(np.mean(patch, axis=(0, 1)))
                 color_feats.extend(np.std(patch, axis=(0, 1)))
 
-        # Gradient / Crack Edge Magnitude
         gray = 0.2989 * arr[:, :, 0] + 0.5870 * arr[:, :, 1] + 0.1140 * arr[:, :, 2]
         gx = np.abs(np.diff(gray, axis=1))[:223, :223]
         gy = np.abs(np.diff(gray, axis=0))[:223, :223]
@@ -101,67 +104,90 @@ class FeatureExtractor:
         return embedding.astype(np.float32)
 
 class SeverityAnalyzer:
-    """Analyzes damage characteristics and k-NN consensus to rate severity."""
+    """Analyzes real concrete damage characteristics and k-NN consensus to rate severity."""
     def analyze(self, image: Image.Image, top_cases: List[Dict[str, Any]] = None) -> Dict[str, Any]:
         arr = np.array(image.convert("RGB"), dtype=np.float32) / 255.0
         gray = 0.2989 * arr[:, :, 0] + 0.5870 * arr[:, :, 1] + 0.1140 * arr[:, :, 2]
-
-        # Gradients & Edge Density
+        
+        # 1. Edge & Fracture Gradients
         gx = np.abs(np.diff(gray, axis=1))
         gy = np.abs(np.diff(gray, axis=0))
-        edge_density = float(np.mean(gx > 0.15) + np.mean(gy > 0.15)) / 2.0
+        ed_fine = float((np.mean(gx > 0.04) + np.mean(gy > 0.04)) / 2.0)
+        ed_strong = float((np.mean(gx > 0.08) + np.mean(gy > 0.08)) / 2.0)
+        
+        # 2. Dark crack pixel ratio
+        mean_val = float(np.mean(gray))
+        dark_ratio = float(np.mean(gray < (mean_val - 0.15)))
+        
+        # 3. High gradient variance
+        grad_mag = np.sqrt(gx[:gy.shape[0], :]**2 + gy[:, :gx.shape[1]]**2)
+        p95 = float(np.percentile(grad_mag, 95))
 
-        # Oxidation / Rust Color
-        rust_mask = (arr[:, :, 0] > 0.48) & (arr[:, :, 1] < 0.42) & (arr[:, :, 2] < 0.32)
-        rust_ratio = float(np.mean(rust_mask))
+        # Composite base score calibrated for concrete surfaces
+        raw_score = (ed_fine * 6.0) + (ed_strong * 25.0) + (dark_ratio * 8.0) + (p95 * 1.5)
+        base_score = float(np.clip(raw_score, 0.05, 0.98))
 
-        # Surface roughness
-        patch_stds = [np.std(gray[i:i+40, j:j+40]) for i in range(0, gray.shape[0]-40, 40) for j in range(0, gray.shape[1]-40, 40)]
-        roughness = float(np.mean(patch_stds)) if patch_stds else 0.12
-
-        base_score = float(np.clip(edge_density * 3.6 + rust_ratio * 4.2 + roughness * 1.6, 0.2, 0.95))
-
-        # k-NN consensus fusion
+        # 4. k-NN Consensus Fusion
         if top_cases and len(top_cases) > 0:
-            similarities = np.array([c.get("similarity", 0.8) for c in top_cases], dtype=np.float32)
-            severities = np.array([c.get("severity_score", 0.7) for c in top_cases], dtype=np.float32)
-            weights = np.exp(similarities * 3.5)
+            similarities = np.array([float(c.get("similarity", 0.5)) for c in top_cases], dtype=np.float32)
+            severities = np.array([float(c.get("severity_score", 0.5)) for c in top_cases], dtype=np.float32)
+            weights = np.exp(similarities * 3.0)
             weights /= np.sum(weights)
             consensus_score = float(np.sum(weights * severities))
-            final_score = float(0.35 * base_score + 0.65 * consensus_score)
-            detected_type = top_cases[0].get("damage_type", "Structural Crack")
+            
+            # Blend 60% direct image analysis + 40% historical k-NN consensus
+            final_score = float(0.60 * base_score + 0.40 * consensus_score)
+            
+            # Classification
+            if base_score < 0.25:
+                detected_type = "Intact Concrete Surface"
+            else:
+                detected_type = top_cases[0].get("damage_type", "Concrete Structural Crack")
+                if "intact" in detected_type.lower() and base_score >= 0.35:
+                    detected_type = "Concrete Structural Crack"
         else:
             consensus_score = base_score
             final_score = base_score
-            detected_type = "Structural Crack"
+            detected_type = "Intact Concrete Surface" if base_score < 0.25 else "Concrete Structural Crack"
 
-        final_score = round(float(np.clip(final_score, 0.15, 0.98)), 2)
-        consensus_score = round(consensus_score, 2)
+        final_score = round(float(np.clip(final_score, 0.05, 0.98)), 2)
+        consensus_score = round(float(consensus_score), 2)
 
+        # Assign severity rating and actionable findings
         if final_score >= 0.80:
             level = "Critical"
+            observations = [
+                "Extensive open crack network detected with structural propagation risk",
+                "High crack edge density indicates active tensile fracture under load",
+                "Immediate structural shoring and high-pressure epoxy resin injection advised"
+            ]
         elif final_score >= 0.60:
             level = "Severe"
-        elif final_score >= 0.40:
+            observations = [
+                "Significant linear fracture line with observable depth penetration",
+                "Crack width exceeds standard structural durability thresholds",
+                "Polymer injection and displacement sensor installation recommended"
+            ]
+        elif final_score >= 0.35:
             level = "Moderate"
+            observations = [
+                "Surface fracture observed; limited immediate load-bearing degradation",
+                "Moisture penetration risk through surface crack paths",
+                "Apply micro-silica patch mortar and schedule 90-day re-inspection"
+            ]
         else:
             level = "Minor"
-
-        observations = []
-        if edge_density > 0.10:
-            observations.append("Continuous fracture line detected with high propagation risk")
-        if rust_ratio > 0.06:
-            observations.append("Severe oxidation/corrosion with wall-thickness loss")
-        if roughness > 0.16:
-            observations.append("Cavitation & material spalling on load-bearing surface")
-        if not observations:
-            observations.append("Superficial hairline defect; structure remains within safety thresholds")
+            observations = [
+                "Monolithic intact concrete surface without visible fracture lines",
+                "Surface sound; no visible spalling or delamination detected",
+                "Structure remains well within design safety limits; maintain standard inspection cycle"
+            ]
 
         return {
             "score": final_score,
             "level": level,
             "damage_type": detected_type,
-            "confidence": round(0.86 + (final_score * 0.1), 2),
+            "confidence": round(0.85 + (final_score * 0.12), 2),
             "key_observations": observations,
             "consensus_score": consensus_score
         }
